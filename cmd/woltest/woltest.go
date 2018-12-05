@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
@@ -36,7 +37,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ip, err := wakeup.Wait(ifaceName, udpPort)
+	ip, err := wakeup.Wait(context.Background(), ifaceName, udpPort)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed: %+v\n", err)
 		os.Exit(1)

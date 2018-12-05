@@ -2,33 +2,34 @@ package wakeup
 
 import (
 	"bytes"
+	"context"
+	"gopkg.in/tomb.v2"
 	"net"
 	"strings"
 
 	"github.com/pkg/errors"
-	"gopkg.in/tomb.v2"
 )
 
-func Wait(ifaceName string, udpPort int) (net.IP, error) {
+func Wait(ctx context.Context, ifaceName string, udpPort int) (string, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to find interface '%s'", ifaceName)
+		return "", errors.Wrapf(err, "failed to find interface '%s'", ifaceName)
 	}
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get addresses for interface '%s'", ifaceName)
+		return "", errors.Wrapf(err, "failed to get addresses for interface '%s'", ifaceName)
 	}
 	if len(addrs) == 0 {
-		return nil, errors.Errorf("interface '%s' has no addresses", ifaceName)
+		return "", errors.Errorf("interface '%s' has no addresses", ifaceName)
 	}
 	hw := iface.HardwareAddr
 	if len(hw) != 6 {
-		return nil, errors.Errorf("unknown hardware address format for interface '%s'", ifaceName)
+		return "", errors.Errorf("unknown hardware address format for interface '%s'", ifaceName)
 	}
 	var ifaceMac [6]byte
 	copy(ifaceMac[:], hw)
-	t := tomb.Tomb{}
-	results := make(chan net.IP, len(addrs))
+	t, ctx := tomb.WithContext(ctx)
+	results := make(chan string, len(addrs))
 	for i := range addrs {
 		addr := addrs[i]
 		if !strings.Contains(addr.Network(), "ip") {
@@ -40,7 +41,7 @@ func Wait(ifaceName string, udpPort int) (net.IP, error) {
 		}
 		udpAddr := &net.UDPAddr{IP: ip, Port: udpPort}
 		t.Go(func() error {
-			ip, err := wait(udpAddr, ifaceMac)
+			ip, err := wait(ctx, udpAddr, ifaceMac)
 			if err == nil {
 				results <- ip
 				return errPacketFound
@@ -52,29 +53,34 @@ func Wait(ifaceName string, udpPort int) (net.IP, error) {
 	close(results)
 	if err == errPacketFound {
 		ip := <-results
-		if ip == nil {
-			return nil, errors.Errorf("no result in response")
+		if ip == "" {
+			return "", errors.Errorf("no result in response")
 		}
 		return ip, nil
 	}
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to wait for packet")
+		return "", errors.Wrapf(err, "failed to wait for packet")
 	}
-	return nil, errors.Errorf("invalid response from wait process")
+	return "", errors.Errorf("invalid response from wait process")
 }
 
 var errPacketFound = errors.New("packet found")
 
-func wait(addr *net.UDPAddr, expectedMac [6]byte) (net.IP, error) {
-	conn, err := net.ListenUDP("udp", addr)
+func wait(ctx context.Context, addr *net.UDPAddr, expectedMac [6]byte) (string, error) {
+	listener := &net.ListenConfig{}
+	conn, err := listener.ListenPacket(ctx, "udp", addr.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen for UDP")
+		return "", errors.Wrapf(err, "failed to listen for UDP")
 	}
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
 	buf := make([]byte, 108)
 	for {
-		n, _, _, cAddr, err := conn.ReadMsgUDP(buf, nil)
+		n, cAddr, err := conn.ReadFrom(buf)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to read UDP message")
+			return "", errors.Wrapf(err, "failed to read UDP message")
 		}
 		if n < 102 {
 			continue
@@ -100,8 +106,8 @@ func wait(addr *net.UDPAddr, expectedMac [6]byte) (net.IP, error) {
 			continue
 		}
 		if mac != expectedMac {
-			return nil, errors.Errorf("Received packet with wrong MAC address %s, expected %s", net.HardwareAddr(mac[:]), net.HardwareAddr(expectedMac[:]))
+			return "", errors.Errorf("Received packet with wrong MAC address %s, expected %s", net.HardwareAddr(mac[:]), net.HardwareAddr(expectedMac[:]))
 		}
-		return cAddr.IP, nil
+		return cAddr.String(), nil
 	}
 }
